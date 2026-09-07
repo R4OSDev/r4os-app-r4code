@@ -295,22 +295,20 @@ const App = struct {
         self.updateMetrics();
         self.render();
 
+        var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
         while (!self.quit_requested) {
             var needs_render = false;
-            if (self.ctx.sys.programShouldClose() and self.dialog == .none) {
-                self.requestAction(.exit_app);
-                needs_render = true;
-            }
-
-            var event: r4os.abi.GuiEvent = .{};
-            while (self.ctx.desk.guiPollEvent(&event) > 0) {
-                self.handleEvent(event);
-                needs_render = true;
-                if (self.quit_requested) break;
+            switch (events.wait(r4os.time_contract.timeoutForever())) {
+                .message => |message| {
+                    const event = message.guiEvent() orelse continue;
+                    self.handleEvent(event);
+                    needs_render = true;
+                },
+                .failure => |raw| return raw,
+                .timed_out => {},
             }
             if (self.quit_requested) break;
             if (needs_render) self.render();
-            self.ctx.sys.sleepTicks(3);
         }
         return 0;
     }
