@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.2`
+- Version: `0.1.4`
 - Image target: `/SOFTWARE/R4CODE/R4CODE.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -28,6 +28,10 @@ last verified standalone dependency identities; workspace builds use the
 mapped local checkouts.
 
 ## Documentation
+
+TextArea computes visible rows and caret/scroll extents in one bounded
+layout pass. The editor delegates edit visibility to that shared owner,
+including one explicit update after a clipboard cut.
 
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in

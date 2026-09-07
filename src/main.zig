@@ -357,7 +357,7 @@ const App = struct {
         if (self.handleShortcut(key)) return;
 
         const view = self.editorView();
-        const changed = switch (key) {
+        _ = switch (key) {
             r4os.gui.Key.ctrl_c => blk: {
                 if (self.editor.copyToClipboard(&self.ctx.desk)) {
                     self.setStatus("Copied selection");
@@ -368,6 +368,7 @@ const App = struct {
             },
             r4os.gui.Key.ctrl_x => blk: {
                 if (self.editor.cutToClipboard(&self.ctx.desk)) {
+                    self.editor.ensureCursorVisible(view);
                     self.markDirty("Cut selection");
                     break :blk true;
                 }
@@ -388,7 +389,6 @@ const App = struct {
                 break :blk did_change;
             },
         };
-        if (changed) self.editor.ensureCursorVisible(view);
     }
 
     fn handleShortcut(self: *App, key: u8) bool {
