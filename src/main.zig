@@ -228,12 +228,14 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     }
 
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.span(ctx.sys.argsRaw()), " \t\r\n"), "/DIALOGTEST")) return runDialogTextSelfTest(&ctx);
     var app = App{ .ctx = &ctx };
     app.init();
     return app.run();
 }
 
 const App = struct {
+    saver: r4os.document_save.Saver = .{},
     ctx: *AppApi,
     editor: Editor = .{},
     menubar_state: r4os.gui.MenubarState = .{},
@@ -256,7 +258,8 @@ const App = struct {
     project_root: [path_capacity]u8 = .{0} ** path_capacity,
     current_path: [path_capacity]u8 = .{0} ** path_capacity,
     selected_path: [path_capacity]u8 = .{0} ** path_capacity,
-    save_file_name: [path_capacity]u8 = .{0} ** path_capacity,
+    save_file_name: r4os.gui.TextField(path_capacity) = .{},
+    save_name_valid: bool = true,
     project_name: ProjectNameField = .{},
     pending_template: ProjectTemplate = .none,
     status: [status_capacity]u8 = .{0} ** status_capacity,
@@ -320,7 +323,7 @@ const App = struct {
                 self.updateMetrics();
                 self.editor.ensureCursorVisible(self.editorView());
             },
-            .key_down => self.handleKey(r4os.gui.eventKey(event), event.modifiers),
+            .key_down => self.handleKey(r4os.gui.eventCodepoint(event), event.modifiers),
             .mouse_down => self.handleMouseDown(event.x, event.y),
             .mouse_up => self.handleMouseUp(event.x, event.y),
             .mouse_move => self.handleMouseMove(event.x, event.y, event.buttons),
@@ -336,12 +339,12 @@ const App = struct {
         self.h = clampI32(canvas.h, 420, 900);
     }
 
-    fn handleKey(self: *App, raw_key: u8, modifiers: u32) void {
-        var key = raw_key;
+    fn handleKey(self: *App, raw_key: u32, modifiers: u32) void {
+        var key: u8 = if (raw_key <= 0xff) @intCast(raw_key) else 0;
         if (key == 0x85 or key == 0x86) key = r4os.gui.Key.menu_focus;
 
         if (self.dialog != .none) {
-            self.handleDialogKey(key);
+            self.handleDialogKey(raw_key);
             return;
         }
 
@@ -383,8 +386,8 @@ const App = struct {
                 break :blk false;
             },
             else => blk: {
-                const did_change = self.editor.handleKeyEx(key, (modifiers & modifier_shift) != 0, view);
-                if (did_change and isTextEditingKey(key)) self.markDirty("Modified");
+                const did_change = self.editor.handleCodepointEx(raw_key, (modifiers & modifier_shift) != 0, view);
+                if (did_change and isTextEditingKey(raw_key)) self.markDirty("Modified");
                 break :blk did_change;
             },
         };
@@ -789,9 +792,12 @@ const App = struct {
             self.setStatus("Loaded text is truncated; use Save As");
             return false;
         }
-        const result = r4std.text_file.saveFromTextArea(&self.ctx.sys, zptr(self.current_path[0..]), &self.editor);
-        if (!result.ok) {
-            self.setStatus("Save failed");
+        const result = self.saver.save(.{ .sys = self.ctx.sys }, .{
+            .ptr = zptr(self.current_path[0..]),
+            .len = @intCast(spanZ(self.current_path[0..]).len),
+        }, self.editor.value(), false);
+        if (!result.committed()) {
+            self.setStatus(result.message());
             self.addOutput("Save failed");
             return false;
         }
@@ -927,9 +933,9 @@ const App = struct {
     fn openFileDialog(self: *App, mode: DialogMode) void {
         if (mode == .save_as) {
             if (self.current_path[0] != 0) {
-                setZ(self.save_file_name[0..], baseName(spanZ(self.current_path[0..])));
-            } else if (self.save_file_name[0] == 0) {
-                setZ(self.save_file_name[0..], "UNTITLED.C");
+                self.setSaveName(baseName(spanZ(self.current_path[0..])));
+            } else if (self.save_file_name.buffer[0] == 0) {
+                self.setSaveName("UNTITLED.C");
             }
         }
 
@@ -950,6 +956,7 @@ const App = struct {
             .project_folder => "Choose parent folder",
             else => "Ready",
         });
+        if (mode == .save_as and !self.save_name_valid) self.setStatus("File name invalid or too long; input retained");
     }
 
     fn loadDirectory(self: *App) bool {
@@ -986,16 +993,18 @@ const App = struct {
         return true;
     }
 
-    fn handleDialogKey(self: *App, key: u8) void {
+    fn handleDialogKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         switch (self.dialog) {
             .save_prompt => self.handleSavePromptAction(self.savePromptKeyAction(key)),
-            .project_name => self.handleProjectNameKey(key),
-            .open_file, .save_as, .open_folder, .project_folder => self.handleFileDialogKey(key),
+            .project_name => self.handleProjectNameKey(codepoint),
+            .open_file, .save_as, .open_folder, .project_folder => self.handleFileDialogKey(codepoint),
             .none => {},
         }
     }
 
-    fn handleProjectNameKey(self: *App, key: u8) void {
+    fn handleProjectNameKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         const dialog = self.projectNameDialog();
         const action = dialog.keyAction(key);
         if (action == .cancel) {
@@ -1006,22 +1015,22 @@ const App = struct {
             self.confirmProjectName();
             return;
         }
-        if (self.project_name.handleClipboardKey(&self.ctx.desk, key)) self.setStatus("Enter project name");
+        if (if (key == r4os.gui.Key.ctrl_c or key == r4os.gui.Key.ctrl_x or key == r4os.gui.Key.ctrl_v) self.project_name.handleClipboardKey(&self.ctx.desk, key) else self.project_name.handleCodepointChecked(codepoint)) self.setStatus("Enter project name");
     }
 
-    fn handleFileDialogKey(self: *App, key: u8) void {
+    fn handleFileDialogKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (key == r4os.gui.Key.escape) {
             self.closeDialog("Cancelled");
             return;
         }
-        if (self.dialog == .save_as and key == r4os.gui.Key.backspace) {
-            backspaceZ(self.save_file_name[0..], 0);
+        if (self.dialog == .save_as and (isFileNameChar(codepoint) or isFieldEditKey(codepoint))) {
+            const changed = self.save_file_name.handleCodepointChecked(codepoint);
+            if (changed and (isFileNameChar(codepoint) or codepoint == r4os.gui.Key.backspace or codepoint == r4os.gui.Key.delete)) self.save_name_valid = true;
+            if (!changed and isFileNameChar(codepoint)) self.setStatus("File name is full; input retained");
             return;
         }
-        if (self.dialog == .save_as and isFileNameChar(key)) {
-            appendZChar(self.save_file_name[0..], key);
-            return;
-        }
+        if (codepoint > 0xff) return;
 
         const dialog = self.fileDialog();
         switch (dialog.keyAction(key)) {
@@ -1134,7 +1143,7 @@ const App = struct {
             }
             return;
         }
-        if (self.dialog == .save_as) setZ(self.save_file_name[0..], baseName(spanZ(self.selected_path[0..])));
+        if (self.dialog == .save_as) self.setSaveName(baseName(spanZ(self.selected_path[0..])));
         self.setStatus("Selected file");
     }
 
@@ -1201,18 +1210,30 @@ const App = struct {
         self.setStatus("Selection failed");
     }
 
+    fn setSaveName(self: *App, value: []const u8) void {
+        self.save_name_valid = self.save_file_name.setExact(value);
+        if (!self.save_name_valid) self.setStatus("File name invalid or too long; input retained");
+    }
+
     fn saveFromDialog(self: *App) void {
-        if (spanZ(self.save_file_name[0..]).len == 0) {
+        if (!self.save_name_valid) {
+            self.setStatus("File name invalid or too long; input retained");
+            return;
+        }
+        if (spanZ(self.save_file_name.buffer[0..]).len == 0) {
             self.setStatus("Enter a file name");
             return;
         }
-        if (!buildPath(self.current_dir[0..], self.save_file_name[0..], self.selected_path[0..])) {
+        if (!buildPath(self.current_dir[0..], self.save_file_name.buffer[0..], self.selected_path[0..])) {
             self.setStatus("Path too long");
             return;
         }
-        const result = r4std.text_file.saveFromTextArea(&self.ctx.sys, zptr(self.selected_path[0..]), &self.editor);
-        if (!result.ok) {
-            self.setStatus("Save failed");
+        const result = self.saver.save(.{ .sys = self.ctx.sys }, .{
+            .ptr = zptr(self.selected_path[0..]),
+            .len = @intCast(spanZ(self.selected_path[0..]).len),
+        }, self.editor.value(), self.loaded_truncated);
+        if (!result.committed()) {
+            self.setStatus(result.message());
             self.addOutput("Save failed");
             return;
         }
@@ -1232,6 +1253,10 @@ const App = struct {
     }
 
     fn loadFile(self: *App, path_buffer: []const u8) bool {
+        if (spanZ(path_buffer).len == 0 or spanZ(path_buffer).len >= path_capacity or !r4os.bounded_text.valid(spanZ(path_buffer))) {
+            self.setStatus("Open path invalid or too long");
+            return false;
+        }
         var path_copy: [path_capacity]u8 = .{0} ** path_capacity;
         copyZ(path_copy[0..], path_buffer);
         const result = r4std.text_file.loadIntoTextArea(&self.ctx.sys, zptr(path_copy[0..]), &self.editor, self.editorView());
@@ -1596,7 +1621,9 @@ const App = struct {
             .path = spanZ(self.current_dir[0..]),
             .items = self.dir_item_slices[0..self.dir_item_count],
             .mode = mode,
-            .file_name = if (mode == .save) spanZ(self.save_file_name[0..]) else "",
+            .file_name = if (mode == .save) self.save_file_name.value() else "",
+            .file_name_cursor = self.save_file_name.cursor,
+            .file_name_selection = r4os.gui.TextRange.normalized(self.save_file_name.cursor, self.save_file_name.selection_anchor orelse self.save_file_name.cursor),
             .ok_text = switch (self.dialog) {
                 .save_as => "Save",
                 .open_folder => "Use",
@@ -1734,7 +1761,10 @@ const App = struct {
     fn openInitialArg(self: *App) void {
         const raw = self.ctx.sys.argsRaw();
         if (raw[0] == 0) return;
-        copyZPtr(self.selected_path[0..], raw);
+        if (!copyZPtr(self.selected_path[0..], raw)) {
+            self.setStatus("Open path invalid or too long; input retained");
+            return;
+        }
         if (isSupportedSourceFile(spanZ(self.selected_path[0..]))) _ = self.loadFile(self.selected_path[0..]);
     }
 };
@@ -2052,28 +2082,19 @@ fn zero(buffer: []u8) void {
 }
 
 fn setZ(buffer: []u8, text: []const u8) void {
-    zero(buffer);
-    if (buffer.len == 0) return;
-    const len = @min(buffer.len - 1, text.len);
-    if (len > 0) @memcpy(buffer[0..len], text[0..len]);
-    buffer[len] = 0;
+    _ = r4os.bounded_text.labelZ(buffer, text);
 }
 
 fn setZResult(buffer: []u8, text: []const u8) bool {
-    if (text.len + 1 > buffer.len) return false;
-    setZ(buffer, text);
-    return true;
+    return r4os.bounded_text.assignZ(buffer, text);
 }
 
 fn copyZ(dest: []u8, source: []const u8) void {
     setZ(dest, spanZ(source));
 }
 
-fn copyZPtr(dest: []u8, source: [*:0]const u8) void {
-    zero(dest);
-    var i: usize = 0;
-    while (i + 1 < dest.len and source[i] != 0) : (i += 1) dest[i] = source[i];
-    if (dest.len > 0) dest[i] = 0;
+fn copyZPtr(dest: []u8, source: [*:0]const u8) bool {
+    return r4os.bounded_text.assignZ(dest, std.mem.span(source));
 }
 
 fn appendZChar(buffer: []u8, ch: u8) void {
@@ -2083,10 +2104,11 @@ fn appendZChar(buffer: []u8, ch: u8) void {
     buffer[len + 1] = 0;
 }
 
-fn backspaceZ(buffer: []u8, min_len: usize) void {
-    const len = zlen(buffer);
-    if (len <= min_len) return;
-    buffer[len - 1] = 0;
+fn isFieldEditKey(codepoint: u32) bool {
+    return switch (codepoint) {
+        r4os.gui.Key.backspace, r4os.gui.Key.delete, r4os.gui.Key.left, r4os.gui.Key.right, r4os.gui.Key.home, r4os.gui.Key.end, r4os.gui.Key.ctrl_a => true,
+        else => false,
+    };
 }
 
 fn zlen(buffer: []const u8) usize {
@@ -2115,24 +2137,15 @@ fn buildPath(dir_buffer: []const u8, name_buffer: []const u8, out: []u8) bool {
 }
 
 fn buildPathText(dir: []const u8, name: []const u8, out: []u8) bool {
-    if (name.len == 0 or out.len == 0) return false;
-    zero(out);
-    if (isAbsolutePath(name)) {
-        if (name.len + 1 > out.len) return false;
-        @memcpy(out[0..name.len], name);
-        out[name.len] = 0;
-        return true;
-    }
-    var len: usize = @min(dir.len, out.len - 1);
-    if (len > 0) @memcpy(out[0..len], dir[0..len]);
-    if (len > 0 and out[len - 1] != '\\' and out[len - 1] != '/') {
-        if (len + 1 >= out.len) return false;
-        out[len] = '\\';
-        len += 1;
-    }
-    if (len + name.len + 1 > out.len) return false;
-    @memcpy(out[len .. len + name.len], name);
-    out[len + name.len] = 0;
+    if (name.len == 0 or !r4os.bounded_text.valid(dir) or !r4os.bounded_text.valid(name)) return false;
+    if (isAbsolutePath(name)) return r4os.bounded_text.assignZ(out, name);
+    const separator: usize = if (dir.len != 0 and dir[dir.len - 1] != '\\' and dir[dir.len - 1] != '/') 1 else 0;
+    if (out.len == 0 or dir.len >= out.len or separator + name.len >= out.len - dir.len) return false;
+    @memcpy(out[0..dir.len], dir);
+    if (separator != 0) out[dir.len] = '\\';
+    const at = dir.len + separator;
+    @memcpy(out[at .. at + name.len], name);
+    @memset(out[at + name.len ..], 0);
     return true;
 }
 
@@ -2224,13 +2237,13 @@ fn validProjectName(name: []const u8) bool {
     return true;
 }
 
-fn isFileNameChar(ch: u8) bool {
-    if (ch < 0x20 or ch >= 0x7F) return false;
+fn isFileNameChar(ch: u32) bool {
+    if (ch < 0x20 or ch > 0x10ffff or (ch >= 0x7f and ch <= 0x9f) or (ch >= 0xd800 and ch <= 0xdfff)) return false;
     return ch != '\\' and ch != '/' and ch != ':' and ch != '*' and ch != '?' and ch != '"' and ch != '<' and ch != '>' and ch != '|';
 }
 
-fn isTextEditingKey(key: u8) bool {
-    return (key >= 0x20 and key < 0x7F) or key == r4os.gui.Key.backspace or key == r4os.gui.Key.delete or key == r4os.gui.Key.enter or key == r4os.gui.Key.tab;
+fn isTextEditingKey(key: u32) bool {
+    return isFileNameChar(key) or key == '/' or key == '\\' or key == ':' or key == '*' or key == '?' or key == '"' or key == '<' or key == '>' or key == '|' or key == r4os.gui.Key.backspace or key == r4os.gui.Key.delete or key == r4os.gui.Key.enter or key == r4os.gui.Key.tab;
 }
 
 fn isSupportedSourceFile(path: []const u8) bool {
@@ -2348,4 +2361,125 @@ fn clampI32(value: i32, min_value: i32, max_value: i32) i32 {
     if (value < min_value) return min_value;
     if (value > max_value) return max_value;
     return value;
+}
+
+fn checkDialogText(app: *App) !void {
+    app.dialog = .save_as;
+    app.setSaveName("ä");
+    app.handleFileDialogKey(r4os.gui.Key.backspace);
+    if (app.save_file_name.value().len != 0) return error.BackspaceScalar;
+    app.handleFileDialogKey(0x20ac);
+    app.handleFileDialogKey(0x1f642);
+    if (!std.mem.eql(u8, app.save_file_name.value(), "€🙂")) return error.CodepointInput;
+    app.handleFileDialogKey(r4os.gui.Key.ctrl_a);
+    app.handleFileDialogKey('x');
+    if (!std.mem.eql(u8, app.save_file_name.value(), "x")) return error.SelectionReplacement;
+    const selected = app.save_file_name;
+    app.handleFileDialogKey(0xd800);
+    if (!std.meta.eql(selected, app.save_file_name)) return error.InvalidScalar;
+    const full = [_]u8{'x'} ** (path_capacity - 1);
+    app.setSaveName(&full);
+    const before = app.save_file_name;
+    app.handleFileDialogKey(0x20ac);
+    if (!std.meta.eql(before, app.save_file_name)) return error.CapacityMutation;
+    const oversized = [_]u8{'x'} ** path_capacity;
+    app.setSaveName(&oversized);
+    if (app.save_name_valid or !std.meta.eql(before, app.save_file_name)) return error.PreloadTruncation;
+    setZ(&app.current_path, "C:\\GUARD.TXT");
+    app.dirty = true;
+    app.saveFromDialog(); // A failed preload must never reach storage.
+    if (!app.dirty or !std.mem.eql(u8, spanZ(&app.current_path), "C:\\GUARD.TXT")) return error.FailedSaveState;
+    app.setSaveName(&full);
+    setZ(&app.current_dir, "C:\\TEMP");
+    setZ(&app.selected_path, "unchanged");
+    app.saveFromDialog(); // Full component cannot fit with this parent.
+    if (!app.dirty or !std.mem.eql(u8, spanZ(&app.current_path), "C:\\GUARD.TXT") or
+        !std.mem.eql(u8, spanZ(&app.selected_path), "unchanged") or
+        !r4os.bounded_text.valid(app.save_file_name.value())) return error.PathCapacityMutation;
+    var short: [8]u8 = @splat(0xa5);
+    const original = short;
+    if (buildPath("C:\\TEMP", "ä🙂", &short) or !std.mem.eql(u8, &original, &short)) return error.PathOutputMutation;
+}
+
+fn checkNativeDialog(app: *App) !void {
+    const directory = "C:\\TEMP\\CODETEXT08543";
+    if (app.ctx.sys.fileInfo(directory)) |_| return error.PrivateDirectoryExists;
+    if (app.ctx.sys.dirCreate(directory) <= 0) return error.CreatePrivateDirectory;
+    setZ(&app.current_dir, directory);
+    app.dialog = .save_as;
+    const payload = "Aä€🙂Z";
+    app.editor.set(payload);
+    app.dirty = true;
+    app.setSaveName("oldä");
+    app.handleFileDialogKey(r4os.gui.Key.backspace);
+    app.handleFileDialogKey(0x20ac);
+    app.handleFileDialogKey(0x1f642);
+    for (".TXT") |byte| app.handleFileDialogKey(byte);
+    const filename = "old€🙂.TXT";
+    if (!std.mem.eql(u8, app.save_file_name.value(), filename)) return error.ActualSaveName;
+    var first: [path_capacity]u8 = @splat(0);
+    if (!buildPath(directory, filename, &first)) return error.ExpectedPath;
+    app.saveFromDialog();
+    if (app.dirty or !std.mem.eql(u8, spanZ(&app.current_path), spanZ(&first))) return error.SaveNotCommitted;
+    var first_bytes: [256]u8 = undefined;
+    const first_len = app.ctx.sys.fileRead(zptr(&first), &first_bytes);
+    if (first_len != payload.len or !std.mem.eql(u8, first_bytes[0..payload.len], payload)) return error.SavedBytes;
+    const long_name = "€" ** 40 ++ "🙂.TXT";
+    var second: [path_capacity]u8 = @splat(0);
+    if (!buildPath(directory, long_name, &second)) return error.LongExpectedPath;
+    app.dialog = .save_as;
+    app.setSaveName(long_name);
+    app.saveFromDialog();
+    if (app.dirty or !std.mem.eql(u8, spanZ(&app.current_path), spanZ(&second))) return error.LongSaveNotCommitted;
+    app.dialog = .save_as;
+    if (!app.loadDirectory()) return error.DirectoryPage;
+    var found = false;
+    for (app.directory_page.rows[0..app.directory_page.count], 0..) |row, index| {
+        if (!r4os.bounded_text.valid(spanZ(&row.label))) return error.SplitLabel;
+        if (!std.mem.eql(u8, spanZ(&row.path), spanZ(&second))) continue;
+        if (!std.mem.endsWith(u8, spanZ(&row.label), "...")) return error.UnmarkedDisplayClip;
+        app.selectDirEntry(index);
+        if (!std.mem.eql(u8, app.save_file_name.value(), long_name)) return error.ClippedIdentity;
+        found = true;
+    }
+    if (!found) return error.MissingExactDirectoryIdentity;
+    const saved_path = app.current_path;
+    const full = [_]u8{'x'} ** (path_capacity - 1);
+    app.setSaveName(&full);
+    app.dirty = true;
+    app.dialog = .save_as;
+    app.saveFromDialog();
+    if (!app.dirty or !std.mem.eql(u8, &saved_path, &app.current_path) or
+        !std.mem.eql(u8, app.save_file_name.value(), &full)) return error.FailedActualSaveState;
+    var second_bytes: [256]u8 = undefined;
+    const second_len = app.ctx.sys.fileRead(zptr(&second), &second_bytes);
+    if (first_len != second_len or first_len <= 0 or !std.mem.eql(u8, first_bytes[0..@intCast(first_len)], second_bytes[0..@intCast(second_len)])) return error.OriginalChanged;
+
+    if (app.ctx.sys.fileDelete(zptr(&first)) <= 0 or app.ctx.sys.fileDelete(zptr(&second)) <= 0 or
+        app.ctx.sys.dirDelete(directory) <= 0) return error.PrivateCleanup;
+}
+
+fn runDialogTextSelfTest(ctx: *AppApi) i32 {
+    var storage = App{ .ctx = ctx };
+    const app = &storage;
+    checkDialogText(app) catch |err| {
+        ctx.sys.write("R4CODE Unicode dialog selftest FAILED: ");
+        ctx.sys.println(@errorName(err));
+        return 1;
+    };
+    app.* = .{ .ctx = ctx };
+    checkNativeDialog(app) catch |err| {
+        ctx.sys.write("R4CODE Unicode dialog selftest FAILED: ");
+        ctx.sys.println(@errorName(err));
+        return 1;
+    };
+    ctx.sys.println("R4CODE Unicode dialog selftest: OK codepoints=whole capacity=retained save=exact labels=separate cleanup=complete");
+    return 0;
+}
+
+test "R4CODE dialog owner Unicode prefill scalar editing and rejected save capacity" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.* = .{ .ctx = undefined };
+    try checkDialogText(app);
 }

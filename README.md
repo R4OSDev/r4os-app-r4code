@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.7`
 - Image target: `/SOFTWARE/R4CODE/R4CODE.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -42,3 +42,23 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+Unicode dialog contract (0.85.43)
+--------------------------------
+Save-as fields accept complete Unicode scalar events and keep separate byte
+cursor/selection positions. Invalid or overlong preloads and failed insertions
+preserve the previous input; a rejected filename cannot be saved until edited
+or replaced by a valid selection. Initial path arguments and constructed paths
+are checked in full, before copying or filesystem access. Directory labels may
+show a whole-scalar prefix plus ...; the stored full path alone identifies a row.
+Glyph coverage is independent of text input. No normalization, grapheme, Bidi
+or shaping promise follows from these scalar operations.
+Build.sh test (Build.bat test on Windows) exercises the actual app dialog owner.
+Tests/DialogText is an explicit IMAGE_SCOPE=none console fixture of the same app
+source. /DIALOGTEST additionally verifies real private file saves, full Unicode
+row identity, failure-state preservation and cleanup; Notepad checks actual
+search values too. It does not claim a manual visual GUI acceptance.
+Save and Save As use the existing SDK document_save.Saver. The old target is
+never passed to fileWrite; path/Dirty change only after confirmed publication.
+Unconfirmed storage publication retains complete recovery copies and edited
+input. A truncated source may be saved only to a missing target.
