@@ -1259,17 +1259,41 @@ const App = struct {
         }
         var path_copy: [path_capacity]u8 = .{0} ** path_capacity;
         copyZ(path_copy[0..], path_buffer);
-        const result = r4std.text_file.loadIntoTextArea(&self.ctx.sys, zptr(path_copy[0..]), &self.editor, self.editorView());
-        if (!result.ok) {
-            self.setStatus("Open failed");
-            self.addOutput("Open failed");
-            return false;
+        // One bounded candidate, separate from the visible document. Count
+        // input bytes, since the text widget may discard CR/control bytes.
+        var candidate: [editor_capacity]u8 = undefined;
+        var offset: usize = 0;
+        const limit = self.editor.maxTextLen();
+        while (offset < limit) {
+            const want = @min(@as(usize, 512), limit - offset);
+            const read = self.ctx.sys.fileReadAt(zptr(path_copy[0..]), @intCast(offset), candidate[offset .. offset + want]);
+            if (read < 0 or read > want) {
+                self.setStatus("Open failed");
+                return false;
+            }
+            if (read == 0) break;
+            offset += @intCast(read);
+        }
+        var truncated = false;
+        if (offset == limit) {
+            // Confirm EOF independently of optional or stale file metadata.
+            const more = self.ctx.sys.fileReadAt(zptr(path_copy[0..]), @intCast(offset), candidate[limit .. limit + 1]);
+            if (more < 0 or more > 1) {
+                self.setStatus("Open failed");
+                return false;
+            }
+            truncated = more != 0;
         }
 
+        const prefix = r4os.bounded_text.loadPrefix(candidate[0 .. offset + @as(usize, if (truncated) 1 else 0)], limit, truncated) orelse {
+            self.setStatus("Open failed: invalid UTF8");
+            return false;
+        };
+        self.editor.set(candidate[0..prefix]);
         copyZ(self.current_path[0..], path_copy[0..]);
         self.setDirFromPath(spanZ(self.current_path[0..]));
         self.dirty = false;
-        self.loaded_truncated = result.truncated;
+        self.loaded_truncated = truncated;
         self.editor.focused = true;
         self.editor.ensureCursorVisible(self.editorView());
         self.setStatus(if (self.loaded_truncated) "Opened truncated at 64 KB limit" else "Opened file");
@@ -2364,6 +2388,7 @@ fn clampI32(value: i32, min_value: i32, max_value: i32) i32 {
 }
 
 fn checkDialogText(app: *App) !void {
+    if (!r4os.gui.checkGraphemeEditing()) return error.GraphemeEditing;
     app.dialog = .save_as;
     app.setSaveName("ä");
     app.handleFileDialogKey(r4os.gui.Key.backspace);

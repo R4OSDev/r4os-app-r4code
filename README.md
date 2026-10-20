@@ -62,3 +62,7 @@ Save and Save As use the existing SDK document_save.Saver. The old target is
 never passed to fileWrite; path/Dirty change only after confirmed publication.
 Unconfirmed storage publication retains complete recovery copies and edited
 input. A truncated source may be saved only to a missing target.
+
+0.85.44: Rebuilt with SDK0.64.57 and the shared R4STD Unicode17.0.0
+extended grapheme editing boundaries. Byte offsets, scalar font advances
+and grapheme clusters are distinct; no shaping or BiDi support is implied.
