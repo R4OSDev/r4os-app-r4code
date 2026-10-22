@@ -190,9 +190,9 @@ const ProjectSummary = struct {
         setZ(self.name[0..], project.name);
         setZ(self.module_kind[0..], project.kind.text());
         setZ(self.language[0..], project.language.?.text());
-        setZ(self.build_profile[0..], r4os.r4mf.buildProfileName(project.language.?, project.entry_mode.?, project.app_class.?));
-        setZ(self.app_class[0..], project.app_class.?.text());
-        _ = buildArtifactPathFor(project.name, self.artifact[0..]);
+        setZ(self.build_profile[0..], if (project.kind == .r4x) r4os.r4mf.buildProfileName(project.language.?, project.entry_mode.?, project.app_class.?) else project.kind.text());
+        setZ(self.app_class[0..], if (project.app_class) |class| class.text() else "");
+        _ = buildArtifactPathFor(project.name, project.kind, self.artifact[0..]);
         setZ(self.target_path[0..], project.target);
         setZ(self.state[0..], "Loaded");
 
@@ -874,6 +874,12 @@ const App = struct {
             return;
         }
 
+        if (!equalsIgnoreCase(spanZ(self.project.module_kind[0..]), "R4X")) {
+            self.setStatus("This module role is loaded by its system owner");
+            self.addOutput("Only R4X applications can be launched directly");
+            return;
+        }
+
         var artifact_path: [path_capacity]u8 = .{0} ** path_capacity;
         if (!self.projectArtifactPath(artifact_path[0..])) {
             self.project.setState("Run path too long");
@@ -1331,7 +1337,7 @@ const App = struct {
         copyZ(self.project_root[0..], self.current_dir[0..]);
         self.setStatus("Project loaded");
         self.addOutput("Project loaded");
-        self.addOutput(r4os.r4mf.buildProfileName(parsed.language.?, parsed.entry_mode.?, parsed.app_class.?));
+        self.addOutput(spanZ(self.project.build_profile[0..]));
     }
 
     fn closeDialog(self: *App, status_text: []const u8) void {
@@ -2173,12 +2179,12 @@ fn buildPathText(dir: []const u8, name: []const u8, out: []u8) bool {
     return true;
 }
 
-fn buildArtifactPathFor(project_name: []const u8, out: []u8) bool {
+fn buildArtifactPathFor(project_name: []const u8, kind: r4os.r4mf.Kind, out: []u8) bool {
     zero(out);
     var len: usize = 0;
     return appendText(out, &len, "out/") and
         appendText(out, &len, project_name) and
-        appendText(out, &len, ".R4X");
+        appendText(out, &len, ".") and appendText(out, &len, kind.text());
 }
 
 fn templateFilePathFor(template: ProjectTemplate, file_name: []const u8, out: []u8) bool {
@@ -2507,4 +2513,21 @@ test "R4CODE dialog owner Unicode prefill scalar editing and rejected save capac
     defer std.testing.allocator.destroy(app);
     app.* = .{ .ctx = undefined };
     try checkDialogText(app);
+}
+
+test "R4CODE dialog owner non-app manifest summaries keep actual role and nullable app fields" {
+    const allocator = std.testing.allocator;
+    inline for (.{ "R4D", "R4P" }) |kind| {
+        const text = "R4OS_MODULE_MANIFEST=2\nKIND=" ++ kind ++ "\nNAME=OWNER\nVERSION=0.1.0\nLANGUAGE=C\nSOURCE=main.c\nTARGET=/R4OS/OWNER." ++ kind ++ "\nIMAGE_SCOPE=none\nIMPORT=R4DEV:Query:1\n";
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const manifest = try r4os.r4mf.parse(arena.allocator(), "Owner/module.R4MF", text);
+        var summary: ProjectSummary = .{};
+        summary.load("Owner/module.R4MF", manifest);
+        try std.testing.expect(summary.valid);
+        try std.testing.expectEqualStrings(kind, spanZ(summary.module_kind[0..]));
+        try std.testing.expectEqualStrings(kind, spanZ(summary.build_profile[0..]));
+        try std.testing.expectEqualStrings("", spanZ(summary.app_class[0..]));
+        try std.testing.expectEqualStrings("out/OWNER." ++ kind, spanZ(summary.artifact[0..]));
+    }
 }
