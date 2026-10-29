@@ -324,6 +324,12 @@ const App = struct {
                 self.editor.ensureCursorVisible(self.editorView());
             },
             .key_down => self.handleKey(r4os.gui.eventCodepoint(event), event.modifiers),
+            .input_reset, .focus_lost => {
+                self.text_selecting = false;
+                self.pressed_toolbar = null;
+                self.dialog_pressed_action = .none;
+                self.menubar_state.close();
+            },
             .mouse_down => self.handleMouseDown(event.x, event.y),
             .mouse_up => self.handleMouseUp(event.x, event.y),
             .mouse_move => self.handleMouseMove(event.x, event.y, event.buttons),
