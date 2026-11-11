@@ -91,3 +91,26 @@ Seit 0.58.30 sind R4CODE, R4BUILD, R4PACK und R4CC vier eigenstaendige
 R4MF-v2-Module. Gemeinsame Compiler-/Packer-Cores liegen einmal unter
 `Shared\` und werden ueber deklarierte ZIG_MODULE-Aliase eingebunden;
 PACKAGE=R4CODE ist ausschliesslich organisatorisch.
+
+Fortschreibung 0.90.73 / R4Code0.1.15
+-----------------------------------
+R4Code verwendet App2, Query2 und das Generation2-Zigprofil. Der bisher
+ungenutzte direkte R4STD-Import ist entfernt. Gemeinsame Metadaten-/Stream-
+Lesevorgaenge, FilePickerSession, typisierte Clipboardangebote und gemessene
+Texttreffer ersetzen lokale beziehungsweise historische Anschluesse.
+Das normale Buildkommando besitzt genau einen asynchronen ToolRun mit
+atomarem LaunchIo, getrennten stdout-/stderr-Pipes, begrenzten ganzen
+UTF8-Records, Prozess-WaitSet und voller Prozessgeneration. Queuedaten,
+Teilskalare und Zeilenenden bleiben bei Backpressure erhalten. Erfolg
+verlangt bestaetigte Completion, EOF, geleerte Records und genaue Reap-
+sowie Endpunktquittungen. Close/Kill verwenden begrenzte Fristen. Ein
+unbestaetigter Stop behaelt die Besitzer bis zum physischen Programmende.
+Neue Projektdateien werden atomar mit Create-only publiziert. Ein Run
+wird an den Desktophost angefordert. Der Selbsttest startet das erzeugte
+GUI ueber DESKRUN, prueft dessen Inhaltsreceipt und beobachtet den genauen
+Prozess bis Close, Desktop-Reap und bestaetigter Beobachtungsfreigabe.
+Die vorhandenen Tests verwenden aktuelle native C2-Beispiele und Profile.
+CODETEXT /DIALOGTEST und /SELFTEST sind die nativen Console-Testeinstiege.
+Die echte Kompositionsabfrage meldet aktuell NoProvider. Dokumentaenderung
+erfordert bestaetigte Controls, waehrend Fokus- und Revisionswechsel den
+lokalen Kompositionszustand verwerfen.

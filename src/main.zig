@@ -1,14 +1,16 @@
 const std = @import("std");
 const r4os = @import("r4os");
-const r4std = @import("r4std");
+pub const tool_run = @import("tool_run.zig");
 
 const AppApi = struct {
+    app: *const r4os.App2,
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
+            .app = r4_app,
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
@@ -31,9 +33,9 @@ const scratch_capacity: usize = 512;
 const template_buffer_capacity: usize = 4096;
 const manifest_arena_capacity: usize = 16 * 1024;
 const project_name_capacity: usize = 32;
-const build_arg_capacity: usize = 256;
+const build_arg_capacity: usize = 128;
 const build_log_capacity: usize = 4096;
-const version_text = "R4CODE 0.58.33";
+const version_text = "R4CODE 0.1.15";
 const sdk_templates_root = "C:\\R4OS\\SDK\\Templates\\R4OS";
 const default_projects_dir = "C:\\PROJECTS";
 const default_projects_root = "C:\\PROJECTS\\";
@@ -190,7 +192,7 @@ const ProjectSummary = struct {
         setZ(self.name[0..], project.name);
         setZ(self.module_kind[0..], project.kind.text());
         setZ(self.language[0..], project.language.?.text());
-        setZ(self.build_profile[0..], if (project.kind == .r4x) r4os.r4mf.buildProfileName(project.language.?, project.entry_mode.?, project.app_class.?) else project.kind.text());
+        setZ(self.build_profile[0..], if (project.kind == .r4x) project.sdk_profile orelse r4os.r4mf.buildProfileName(project.language.?, project.entry_mode.?, project.app_class.?) else project.kind.text());
         setZ(self.app_class[0..], if (project.app_class) |class| class.text() else "");
         _ = buildArtifactPathFor(project.name, project.kind, self.artifact[0..]);
         setZ(self.target_path[0..], project.target);
@@ -220,10 +222,10 @@ const ProjectSummary = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var sys = r4_app.system();
     if (hasSelftestSwitch(trim(zSlice(sys.argsRaw())))) {
-        var selftest = R4CodeSelfTest{ .sys = sys };
+        var selftest = R4CodeSelfTest{ .root = r4_app, .sys = sys };
         return selftest.run();
     }
 
@@ -231,11 +233,31 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.span(ctx.sys.argsRaw()), " \t\r\n"), "/DIALOGTEST")) return runDialogTextSelfTest(&ctx);
     var app = App{ .ctx = &ctx };
     app.init();
+    defer _ = app.clipboard.close();
+    defer {
+        _ = app.composition.cancel(app.composition.id);
+        if (app.composition_client) |*client| _ = client.close();
+    }
+    defer {
+        if (!app.tool.shutdown(ctx.sys)) {
+            _ = ctx.sys.programExit(1, r4os.abi.program_exit_reason_failed);
+            while (true) ctx.sys.sleepTicks(1);
+        }
+    }
     return app.run();
 }
 
 const App = struct {
     saver: r4os.document_save.Saver = .{},
+    clipboard: r4os.gui.TextClipboard = .{},
+    clipboard_status: i32 = 0,
+    composition: r4os.text_composition.Owner = .{ .owner_generation = 1 },
+    composition_client: ?r4os.text_composition_client.Client = null,
+    composition_status: i32 = r4os.abi.composition_error_unsupported,
+    text_revision: u64 = 1,
+    tool: tool_run.Run = .{},
+    building_project: [path_capacity]u8 = .{0} ** path_capacity,
+    output_revision: u64 = 0,
     ctx: *AppApi,
     editor: Editor = .{},
     menubar_state: r4os.gui.MenubarState = .{},
@@ -292,6 +314,8 @@ const App = struct {
     }
 
     fn runHosted(self: *App) i32 {
+        self.probeComposition();
+        self.setStatus("Ready");
         _ = self.ctx.desk.guiSetTitle("R4Code");
         _ = self.ctx.desk.guiSetMinSize(720, 420);
         self.updateMetrics();
@@ -300,7 +324,9 @@ const App = struct {
         var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
         while (!self.quit_requested) {
             var needs_render = false;
-            switch (events.wait(r4os.time_contract.timeoutForever())) {
+            if (self.pollBuild()) self.render();
+            const timeout = if (self.tool.active()) r4os.time_contract.timeoutFinite(.{ .nanoseconds = 10_000_000 }) else r4os.time_contract.timeoutForever();
+            switch (events.wait(timeout)) {
                 .message => |message| {
                     const event = message.guiEvent() orelse continue;
                     self.handleEvent(event);
@@ -319,12 +345,14 @@ const App = struct {
         const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
         switch (kind) {
             .close => self.requestAction(.exit_app),
-            .resize => {
+            .resize, .font_changed => {
+                self.invalidateComposition();
                 self.updateMetrics();
                 self.editor.ensureCursorVisible(self.editorView());
             },
             .key_down => self.handleKey(r4os.gui.eventCodepoint(event), event.modifiers),
             .input_reset, .focus_lost => {
+                self.invalidateComposition();
                 self.text_selecting = false;
                 self.pressed_toolbar = null;
                 self.dialog_pressed_action = .none;
@@ -367,24 +395,24 @@ const App = struct {
         const view = self.editorView();
         _ = switch (key) {
             r4os.gui.Key.ctrl_c => blk: {
-                if (self.editor.copyToClipboard(&self.ctx.desk)) {
+                if (self.copyEditor()) {
                     self.setStatus("Copied selection");
                     break :blk true;
                 }
-                self.setStatus("No selection");
+                self.clipboardFailure("No selection");
                 break :blk false;
             },
             r4os.gui.Key.ctrl_x => blk: {
-                if (self.editor.cutToClipboard(&self.ctx.desk)) {
+                if (self.cutEditor()) {
                     self.editor.ensureCursorVisible(view);
                     self.markDirty("Cut selection");
                     break :blk true;
                 }
-                self.setStatus("No selection");
+                self.clipboardFailure("No selection");
                 break :blk false;
             },
             r4os.gui.Key.ctrl_v => blk: {
-                if (self.editor.pasteFromClipboard(&self.ctx.desk, view)) {
+                if (self.pasteEditor(view)) {
                     self.markDirty("Pasted");
                     break :blk true;
                 }
@@ -494,7 +522,12 @@ const App = struct {
         const editor_rect = self.editorRect(canvas);
         if (!editor_rect.contains(x, y)) return null;
         const text_rect = r4os.gui.textAreaClientRect(editor_rect);
-        return self.editor.hitTest(x - text_rect.x, y - text_rect.y, canvas.font.max_advance, canvas.font.line_height, self.editorView());
+        var index: usize = 0;
+        if (self.editor.hitTestChecked(canvas, x - text_rect.x, y - text_rect.y, self.editorView(), &index) != 0) {
+            self.setStatus("Text measurement unavailable");
+            return null;
+        }
+        return index;
     }
 
     fn executeToolbar(self: *App, action: ToolbarAction) void {
@@ -520,21 +553,21 @@ const App = struct {
             @intFromEnum(Command.file_save_as) => self.openFileDialog(.save_as),
             @intFromEnum(Command.file_exit) => self.requestAction(.exit_app),
             @intFromEnum(Command.edit_cut) => {
-                if (self.editor.cutToClipboard(&self.ctx.desk)) {
+                if (self.cutEditor()) {
                     self.markDirty("Cut selection");
                 } else {
-                    self.setStatus("No selection");
+                    self.clipboardFailure("No selection");
                 }
             },
             @intFromEnum(Command.edit_copy) => {
-                if (self.editor.copyToClipboard(&self.ctx.desk)) {
+                if (self.copyEditor()) {
                     self.setStatus("Copied selection");
                 } else {
-                    self.setStatus("No selection");
+                    self.clipboardFailure("No selection");
                 }
             },
             @intFromEnum(Command.edit_paste) => {
-                if (self.editor.pasteFromClipboard(&self.ctx.desk, self.editorView())) {
+                if (self.pasteEditor(self.editorView())) {
                     self.markDirty("Pasted");
                 } else {
                     self.setStatus("Clipboard empty or text full");
@@ -571,6 +604,7 @@ const App = struct {
     }
 
     fn newDocument(self: *App) void {
+        self.invalidateComposition();
         self.editor.clear();
         self.editor.focused = true;
         zero(self.current_path[0..]);
@@ -743,28 +777,22 @@ const App = struct {
     }
 
     fn readTemplate(self: *App, path: []const u8, out: []u8) ?[]const u8 {
-        var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        setZ(path_z[0..], path);
-        const read = self.ctx.sys.fileRead(zptr(path_z[0..]), out);
-        if (read <= 0) return null;
-        const len: usize = @intCast(read);
-        if (len >= out.len) return null;
-        return out[0..len];
+        return readFileSys(&self.ctx.sys, path, out);
     }
 
     fn writeTextFile(self: *App, path: []const u8, data: []const u8) bool {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        setZ(path_z[0..], path);
-        const written = self.ctx.sys.fileWrite(zptr(path_z[0..]), data);
-        if (written < 0) return false;
-        return @as(usize, @intCast(written)) == data.len;
+        if (!setZResult(path_z[0..], path)) return false;
+        return self.saver.save(.{ .sys = self.ctx.sys }, .{ .ptr = zptr(&path_z), .len = @intCast(path.len) }, data, true).committed();
     }
 
     fn pathExists(self: *App, path: []const u8) bool {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        setZ(path_z[0..], path);
-        if (self.ctx.sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0;
-        return false;
+        if (!setZResult(path_z[0..], path)) return false;
+        return switch (r4os.metadata2.info(&self.ctx.app.context, zptr(&path_z))) {
+            .found => true,
+            else => false,
+        };
     }
 
     fn ensureNewDirectory(self: *App, path: []const u8) bool {
@@ -773,12 +801,7 @@ const App = struct {
     }
 
     fn ensureDirectory(self: *App, path: []const u8) bool {
-        var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        setZ(path_z[0..], path);
-        if (self.ctx.sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0 and info.is_dir != 0;
-        if (self.ctx.sys.dirCreate(zptr(path_z[0..])) < 0) return false;
-        if (self.ctx.sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0 and info.is_dir != 0;
-        return true;
+        return ensureDirectorySys(&self.ctx.sys, path);
     }
 
     fn saveCurrentOrOpenSaveAs(self: *App) void {
@@ -818,6 +841,10 @@ const App = struct {
     }
 
     fn runBuild(self: *App) bool {
+        if (self.tool.active()) {
+            self.setStatus("Build already running");
+            return false;
+        }
         if (self.dirty) {
             if (self.current_path[0] == 0) {
                 self.setStatus("Save file before build");
@@ -834,7 +861,7 @@ const App = struct {
 
         var args: [build_arg_capacity]u8 = .{0} ** build_arg_capacity;
         var len: usize = 0;
-        if (!appendText(args[0..], &len, "BUILD ") or !appendText(args[0..], &len, spanZ(self.project.file[0..]))) {
+        if (!appendText(args[0..], &len, "BUILD \"") or !appendText(args[0..], &len, spanZ(self.project.file[0..])) or !appendText(args[0..], &len, "\"")) {
             self.setStatus("Build args too long");
             self.addOutput("Build args too long");
             self.project.setState("Build args too long");
@@ -842,27 +869,45 @@ const App = struct {
         }
 
         self.addOutput("R4BUILD build");
-        const rc = self.ctx.sys.programRun(r4build_path, zptr(args[0..]));
-        self.addBuildLogToOutput();
-        if (rc == 0) {
-            var artifact_path: [path_capacity]u8 = .{0} ** path_capacity;
-            if (self.projectArtifactPath(artifact_path[0..])) {
-                self.addOutput(spanZ(artifact_path[0..]));
-            }
-            self.project.setState("Build OK");
-            self.setStatus("Build OK");
-            return true;
-        } else if (rc == 2) {
-            self.project.setState("Build blocked");
-            self.setStatus("Build blocked");
-        } else if (rc == 3) {
-            self.project.setState("Capability unsupported");
-            self.setStatus("Capability unsupported");
-        } else {
-            self.project.setState("Build failed");
-            self.setStatus("Build failed");
+        const rc = self.tool.start(&self.ctx.app.context, r4build_path, zptr(args[0..]), 4096);
+        if (rc != 0) {
+            self.project.setState("Build launch failed");
+            self.setStatus("Build launch failed");
+            return false;
         }
-        return false;
+        copyZ(&self.building_project, &self.project.file);
+        self.project.setState("Building");
+        self.setStatus("Building");
+        return true;
+    }
+
+    fn toolSink(raw: ?*anyopaque, chunk: *const r4os.diagnostics.core.Chunk) callconv(.c) r4os.diagnostics.core.Ack {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        if (chunk.offset != 0 or chunk.length != chunk.total) return .{ .kind = @intFromEnum(r4os.diagnostics.core.SinkKind.failed), .error_code = -1 };
+        self.addOutput(std.mem.trimEnd(u8, chunk.data[0..chunk.length], "\r\n"));
+        return .{ .accepted_bytes = chunk.length };
+    }
+
+    fn pollBuild(self: *App) bool {
+        const before = self.output_revision;
+        if (self.tool.poll(self.ctx.sys, toolSink, self)) |result| {
+            const status: []const u8 = if (result.io_error != 0) "Build output failed" else switch (result.completion.exit_code) {
+                0 => "Build OK",
+                2 => "Build blocked",
+                3 => "Capability unsupported",
+                else => "Build failed",
+            };
+            if (std.mem.eql(u8, spanZ(&self.building_project), spanZ(&self.project.file))) {
+                self.project.setState(status);
+                if (result.io_error == 0 and result.completion.exit_code == 0) {
+                    var artifact_path: [path_capacity]u8 = .{0} ** path_capacity;
+                    if (self.projectArtifactPath(&artifact_path)) self.addOutput(spanZ(&artifact_path));
+                }
+            }
+            self.setStatus(status);
+            return true;
+        }
+        return self.output_revision != before;
     }
 
     fn runProjectArtifact(self: *App) void {
@@ -902,10 +947,10 @@ const App = struct {
 
         self.addOutput("Run artifact");
         self.addOutput(spanZ(artifact_path[0..]));
-        const rc = self.ctx.sys.programRun(zptr(artifact_path[0..]), "");
-        if (rc == 0) {
-            self.project.setState("Run OK");
-            self.setStatus("Run OK");
+        const rc = self.ctx.desk.programRequestHostLaunch(zptr(artifact_path[0..]), "", .auto);
+        if (rc >= 0) {
+            self.project.setState("Run requested");
+            self.setStatus("Run requested");
         } else {
             self.project.setState("Run failed");
             self.setStatus("Run failed");
@@ -920,29 +965,8 @@ const App = struct {
         return buildPathText(spanZ(project_dir[0..]), spanZ(self.project.artifact[0..]), out);
     }
 
-    fn addBuildLogToOutput(self: *App) void {
-        var log_path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        setZ(log_path_z[0..], r4build_log_path);
-        var log_data: [build_log_capacity]u8 = undefined;
-        const read = self.ctx.sys.fileRead(zptr(log_path_z[0..]), log_data[0..]);
-        if (read <= 0) {
-            self.addOutput("R4BUILD log missing");
-            return;
-        }
-        const len: usize = @intCast(read);
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= len) : (i += 1) {
-            if (i == len or log_data[i] == '\n') {
-                var end = i;
-                while (end > start and (log_data[end - 1] == '\r' or log_data[end - 1] == '\n')) end -= 1;
-                if (end > start) self.addOutput(log_data[start..end]);
-                start = i + 1;
-            }
-        }
-    }
-
     fn openFileDialog(self: *App, mode: DialogMode) void {
+        self.invalidateComposition();
         if (mode == .save_as) {
             if (self.current_path[0] != 0) {
                 self.setSaveName(baseName(spanZ(self.current_path[0..])));
@@ -1161,6 +1185,10 @@ const App = struct {
 
     fn resolveDirEntry(self: *App, index: usize) i32 {
         if (index >= self.directory_page.count) return -1;
+        if (self.directory_page.verify(.{ .sys = self.ctx.sys }, index) != 0) {
+            self.setStatus("Directory changed; reopen the page");
+            return -1;
+        }
         const row = &self.directory_page.rows[index];
         setZ(self.selected_path[0..], spanZ(row.path[0..]));
         return switch (row.kind) {
@@ -1274,33 +1302,23 @@ const App = struct {
         // One bounded candidate, separate from the visible document. Count
         // input bytes, since the text widget may discard CR/control bytes.
         var candidate: [editor_capacity]u8 = undefined;
-        var offset: usize = 0;
+        const files: r4os.Files = .{ .sys = self.ctx.sys };
+        const observed = switch (files.readDocumentPrefix(.{ .ptr = zptr(path_copy[0..]), .len = @intCast(spanZ(path_copy[0..]).len) }, &candidate, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 }))) {
+            .value => |value| value,
+            .failure => {
+                self.setStatus("Open failed");
+                return false;
+            },
+        };
         const limit = self.editor.maxTextLen();
-        while (offset < limit) {
-            const want = @min(@as(usize, 512), limit - offset);
-            const read = self.ctx.sys.fileReadAt(zptr(path_copy[0..]), @intCast(offset), candidate[offset .. offset + want]);
-            if (read < 0 or read > want) {
-                self.setStatus("Open failed");
-                return false;
-            }
-            if (read == 0) break;
-            offset += @intCast(read);
-        }
-        var truncated = false;
-        if (offset == limit) {
-            // Confirm EOF independently of optional or stale file metadata.
-            const more = self.ctx.sys.fileReadAt(zptr(path_copy[0..]), @intCast(offset), candidate[limit .. limit + 1]);
-            if (more < 0 or more > 1) {
-                self.setStatus("Open failed");
-                return false;
-            }
-            truncated = more != 0;
-        }
+        const truncated = observed.truncated;
+        const offset = if (truncated) limit else observed.bytes;
 
         const prefix = r4os.bounded_text.loadPrefix(candidate[0 .. offset + @as(usize, if (truncated) 1 else 0)], limit, truncated) orelse {
             self.setStatus("Open failed: invalid UTF8");
             return false;
         };
+        self.invalidateComposition();
         self.editor.set(candidate[0..prefix]);
         copyZ(self.current_path[0..], path_copy[0..]);
         self.setDirFromPath(spanZ(self.current_path[0..]));
@@ -1440,7 +1458,7 @@ const App = struct {
         const output = self.outputRect(canvas);
         self.drawProjectPanel(canvas, scratch, project_panel);
         _ = canvas.rect(editor, palette.client_bg);
-        _ = self.editor.draw(canvas, editor, scratch);
+        if (self.editor.draw(canvas, editor, scratch) < 0) self.setStatus("Text rendering unavailable. Document retained");
         self.drawOutputPanel(canvas, scratch, output);
     }
 
@@ -1723,6 +1741,7 @@ const App = struct {
     }
 
     fn markDirty(self: *App, status_text: []const u8) void {
+        self.invalidateComposition();
         self.dirty = true;
         self.loaded_truncated = false;
         if (isR4MFFile(spanZ(self.current_path[0..]))) self.project.markSourceDirty();
@@ -1751,13 +1770,107 @@ const App = struct {
         setZ(out, "Untitled");
     }
 
+    fn invalidateComposition(self: *App) void {
+        _ = self.composition.cancel(self.composition.id);
+        self.text_revision +|= 1;
+    }
+
+    fn probeComposition(self: *App) void {
+        if (self.composition_client == null) {
+            var client: r4os.text_composition_client.Client = undefined;
+            self.composition_status = self.ctx.app.compositionClient(self.ctx.sys.ticksFromMilliseconds(500), &client);
+            if (self.composition_status != 0) return;
+            self.composition_client = client;
+        }
+        const client = &self.composition_client.?;
+        var capability: r4os.abi.CompositionCapabilityReply = .{};
+        self.composition_status = client.capability(&capability);
+        if (self.composition_status != 0) return;
+        var focus: r4os.abi.CompositionFocus = .{};
+        const available = r4os.text_composition.providerStatus(capability.provider);
+        if (available == 0) {
+            var handle: r4os.abi.ProgramProcessHandle = .{};
+            self.composition_status = self.ctx.sys.programOpenHandle(@intCast(self.ctx.app.startContext().instance_id), &handle);
+            if (self.composition_status != 0) return;
+            const window_id = self.ctx.desk.programWindowId();
+            if (window_id < 0) {
+                self.composition_status = r4os.abi.composition_error_no_focus;
+                return;
+            }
+            var window = r4os.window_mode.Client{ .owner = handle, .window_id = @intCast(window_id) };
+            if (!window.poll(&self.ctx.sys)) {
+                self.composition_status = window.last_error;
+                return;
+            }
+            var reply: r4os.abi.CompositionFocusReply = .{};
+            self.composition_status = client.focus(&window.state.identity, &reply);
+            if (self.composition_status != 0) return;
+            if (reply.result != 0) {
+                self.composition_status = reply.result;
+                return;
+            }
+            focus = reply.focus;
+        }
+        var id: r4os.text_composition.Id = undefined;
+        self.composition_status = self.editor.beginComposition(&self.composition, &focus, &capability.provider, self.text_revision, &r4os.abi.CompositionCaret{}, &id);
+    }
+
+    fn copyEditor(self: *App) bool {
+        if (!self.editor.hasSelection()) {
+            self.clipboard_status = r4os.abi.clipboard_offer_error_not_found;
+            return false;
+        }
+        self.clipboard_status = self.clipboard.connect(&self.ctx.sys);
+        if (self.clipboard_status != 0) return false;
+        self.clipboard_status = self.clipboard.copy(self.editor.selectedValue());
+        return self.clipboard_status == 0;
+    }
+
+    fn cutEditor(self: *App) bool {
+        if (!self.copyEditor()) return false;
+        return self.editor.deleteSelection();
+    }
+
+    fn pasteEditor(self: *App, view: r4os.gui.TextAreaView) bool {
+        self.clipboard_status = self.clipboard.connect(&self.ctx.sys);
+        if (self.clipboard_status != 0) return false;
+        const buffer = self.ctx.sys.allocator().alloc(u8, editor_capacity) catch {
+            self.clipboard_status = r4os.abi.clipboard_offer_error_too_large;
+            return false;
+        };
+        defer self.ctx.sys.allocator().free(buffer);
+        const count = self.clipboard.read(buffer);
+        self.clipboard_status = if (count < 0) count else 0;
+        if (count <= 0) return false;
+        if (!self.editor.pasteSliceChecked(buffer[0..@intCast(count)], view)) {
+            self.clipboard_status = r4os.abi.clipboard_offer_error_too_large;
+            return false;
+        }
+        return true;
+    }
+
+    fn clipboardFailure(self: *App, empty: []const u8) void {
+        if (self.clipboard_status == 0 or self.clipboard_status == r4os.abi.clipboard_offer_error_not_found) {
+            self.setStatus(empty);
+            return;
+        }
+        var message: [status_capacity]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&message, "Clipboard failed ({d})", .{self.clipboard_status}) catch "Clipboard failed");
+    }
+
     fn setStatus(self: *App, message: []const u8) void {
-        setZ(self.status[0..], message);
+        var combined: [status_capacity * 2]u8 = undefined;
+        const value = if (self.composition_status == r4os.abi.composition_error_no_provider)
+            std.fmt.bufPrint(&combined, "{s} | IME unavailable", .{message}) catch message
+        else
+            message;
+        _ = r4os.bounded_text.labelZ(self.status[0..], value);
     }
 
     fn addOutput(self: *App, message: []const u8) void {
+        self.output_revision +|= 1;
         if (self.output_count < output_line_count) {
-            setZ(self.output_lines[self.output_count][0..], message);
+            _ = r4os.bounded_text.labelZ(self.output_lines[self.output_count][0..], message);
             self.output_count += 1;
             return;
         }
@@ -1765,7 +1878,7 @@ const App = struct {
         while (i < output_line_count) : (i += 1) {
             copyZ(self.output_lines[i - 1][0..], self.output_lines[i][0..]);
         }
-        setZ(self.output_lines[output_line_count - 1][0..], message);
+        _ = r4os.bounded_text.labelZ(self.output_lines[output_line_count - 1][0..], message);
     }
 
     fn rememberOpenPath(self: *App, path: []const u8) void {
@@ -1806,12 +1919,32 @@ const App = struct {
 };
 
 const R4CodeSelfTest = struct {
+    root: *const r4os.App2,
     sys: r4os.r4sys.Context,
     log_buffer: [build_log_capacity]u8 = undefined,
     template_buffer: [template_buffer_capacity]u8 = undefined,
     source_template_buffer: [template_buffer_capacity]u8 = undefined,
     project_buffer: [template_buffer_capacity]u8 = undefined,
     source_buffer: [template_buffer_capacity]u8 = undefined,
+    capture_used: ?usize = null,
+
+    const ToolOutput = struct {
+        test_owner: *R4CodeSelfTest,
+        output: *r4os.launch_io.Output,
+
+        fn write(raw: ?*anyopaque, chunk: *const r4os.diagnostics.core.Chunk) callconv(.c) r4os.diagnostics.core.Ack {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.test_owner.capture_used) |used| {
+                if (chunk.length > self.test_owner.log_buffer.len - used) return .{ .kind = @intFromEnum(r4os.diagnostics.core.SinkKind.failed), .error_code = -1 };
+            }
+            const ack = r4os.launch_io.Output.recordSink(self.output, chunk);
+            if (self.test_owner.capture_used) |used| {
+                @memcpy(self.test_owner.log_buffer[used..][0..ack.accepted_bytes], chunk.data[0..ack.accepted_bytes]);
+                self.test_owner.capture_used = used + ack.accepted_bytes;
+            }
+            return ack;
+        }
+    };
 
     fn run(self: *R4CodeSelfTest) i32 {
         self.sys.println(version_text);
@@ -1835,9 +1968,7 @@ const R4CodeSelfTest = struct {
         )) return 1;
 
         self.sys.println("R4CODE run console artifact");
-        const console_id = self.sys.programSpawn(r4code_selftest_console_artifact_path, "", .console);
-        if (console_id < 0) return self.fail("console artifact run failed");
-        self.sys.sleepTicks(20);
+        if (self.runTool(r4code_selftest_console_artifact_path, "") != 0) return self.fail("console artifact run failed");
 
         if (!writeFileSys(&self.sys, r4code_selftest_console_source_path, r4code_selftest_bad_source)) return self.fail("bad source write failed");
         const bad_rc = self.runBuildWorker("BUILD", r4code_selftest_console_project_path);
@@ -1863,12 +1994,7 @@ const R4CodeSelfTest = struct {
         )) return 1;
 
         self.sys.println("R4CODE run desktop artifact");
-        const desktop_id = self.sys.programSpawn(r4code_selftest_desktop_artifact_path, "", .gui);
-        if (desktop_id < 0) return self.fail("desktop artifact run failed");
-        if (self.sys.programRequestClose(@intCast(desktop_id)) != 0) return self.fail("desktop close request failed");
-        self.sys.println("R4CODE desktop close requested");
-        self.sys.sleepTicks(20);
-        _ = self.sys.programKill(@intCast(desktop_id));
+        if (!self.runDesktop()) return self.fail("desktop artifact close failed");
 
         self.sys.println("R4CODE result: OK");
         return 0;
@@ -1935,54 +2061,92 @@ const R4CodeSelfTest = struct {
         if (!fileExistsSys(&self.sys, artifact_path)) return self.failCheck("artifact missing");
         if (!self.logContains("R4CC compile: OK") or !self.logContains("R4PACK package: OK")) return self.failCheck("build log incomplete");
         if (desktop) {
-            if (!self.logContains("R4X_C_App_Desktop")) return self.failCheck("desktop profile missing");
-            if (!self.logContains("import from R4MF: R4DESK:Query:1") or !self.logContains("import from R4MF: R4DRAW:Query:1")) return self.failCheck("desktop imports missing");
+            if (!self.logContains("BUILD_PROFILE=r4os-c-generation2") or !self.logContains("APP_PROFILE=desktop")) return self.failCheck("desktop profile missing");
+            if (!self.logContains("import from R4MF: R4DESK:Query2:2") or !self.logContains("import from R4MF: R4DRAW:Query2:2")) return self.failCheck("desktop imports missing");
             if (!self.logContains("metadata: r4x.class=gui")) return self.failCheck("desktop gui metadata missing");
         } else {
-            if (!self.logContains("R4X_C_App_Console")) return self.failCheck("console profile missing");
+            if (!self.logContains("BUILD_PROFILE=r4os-c-generation2") or !self.logContains("APP_PROFILE=console")) return self.failCheck("console profile missing");
         }
         return true;
     }
 
     fn runBuildWorker(self: *R4CodeSelfTest, command: []const u8, project_path: []const u8) i32 {
-        var args: [build_arg_capacity]u8 = .{0} ** build_arg_capacity;
-        var len: usize = 0;
-        if (!appendText(args[0..], &len, command) or
-            !appendText(args[0..], &len, " ") or
-            !appendText(args[0..], &len, project_path))
-        {
-            return -2;
-        }
+        var args: [build_arg_capacity]u8 = undefined;
+        const value = std.fmt.bufPrintZ(&args, "{s} \"{s}\"", .{ command, project_path }) catch return -2;
         self.sys.write("R4CODE build command: ");
         self.sys.println(command);
-        _ = writeFileSys(&self.sys, r4build_log_path, "R4CODE build pending\r\n");
-        const instance_id = self.sys.programSpawn(r4build_path, zptr(args[0..]), .console);
-        if (instance_id < 0) return -2;
-        return self.waitBuildResult(command);
+        return self.runTool(r4build_path, value);
     }
 
-    fn waitBuildResult(self: *R4CodeSelfTest, command: []const u8) i32 {
-        var attempt: usize = 0;
-        while (attempt < 160) : (attempt += 1) {
-            const read = self.sys.fileRead(r4build_log_path, self.log_buffer[0..]);
-            if (read > 0) {
-                const len: usize = @intCast(read);
-                const text = self.log_buffer[0..len];
-                if (equalsIgnoreCase(command, "VALIDATE")) {
-                    if (contains(text, "validate result: OK")) return 0;
-                    if (contains(text, "validate result: FAILED")) return 1;
-                } else if (equalsIgnoreCase(command, "PLAN")) {
-                    if (contains(text, "plan result: OK")) return 0;
-                    if (contains(text, "plan result: FAILED")) return 1;
-                } else {
-                    if (contains(text, "build result: OK")) return 0;
-                    if (contains(text, "build result: FAILED")) return 1;
-                    if (contains(text, "build result: BLOCKED")) return 2;
-                }
+    fn runTool(self: *R4CodeSelfTest, path: [*:0]const u8, args: [*:0]const u8) i32 {
+        var worker: tool_run.Run = .{};
+        defer {
+            if (!worker.shutdown(self.sys)) {
+                _ = self.sys.programExit(1, r4os.abi.program_exit_reason_failed);
+                while (true) self.sys.sleepTicks(1);
             }
-            self.sys.sleepTicks(3);
         }
-        return -3;
+        var output: r4os.launch_io.Output = undefined;
+        if (r4os.launch_io.Output.init(self.root, &output) != 0) return -2;
+        var destination = ToolOutput{ .test_owner = self, .output = &output };
+        const rc = worker.start(&self.root.context, path, args, 64);
+        if (rc != 0) {
+            self.toolResult("start", rc);
+            return rc;
+        }
+        while (worker.active()) {
+            if (self.sys.programShouldClose()) return -2;
+            if (worker.poll(self.sys, ToolOutput.write, &destination)) |result| {
+                if (result.io_error != 0 or output.failed) {
+                    self.toolResult("output", result.io_error);
+                    return -2;
+                }
+                if (result.completion.exit_code != 0) self.toolResult("exit", result.completion.exit_code);
+                return result.completion.exit_code;
+            }
+            self.sys.sleepTicks(1);
+        }
+        return -2;
+    }
+
+    fn runDesktop(self: *R4CodeSelfTest) bool {
+        self.capture_used = 0;
+        defer self.capture_used = null;
+        if (self.runTool("C:\\R4OS\\SOFTWARE\\TERMINAL\\DESKRUN.R4X", "/JSON /WAITFRAME " ++ r4code_selftest_desktop_artifact_path) != 0) return false;
+        const Receipt = struct { process_id: u32, process_generation: u64, terminal: bool, content: u64 };
+        const receipt = std.json.parseFromSlice(Receipt, self.sys.allocator(), std.mem.trim(u8, self.log_buffer[0..self.capture_used.?], " \t\r\n"), .{ .ignore_unknown_fields = true }) catch return false;
+        defer receipt.deinit();
+        if (!receipt.value.terminal or receipt.value.content == 0 or receipt.value.process_id == 0 or receipt.value.process_generation == 0) return false;
+        const child = r4os.abi.ProgramProcessHandle{ .instance_id = receipt.value.process_id, .generation = receipt.value.process_generation };
+        var observation: r4os.abi.ProgramObservationHandle = .{};
+        if (self.sys.programObservationRetain(&child, 0, &observation) != 0) return false;
+        var retained = true;
+        defer if (retained) {
+            _ = self.sys.programObservationRelease(&observation);
+        };
+        if (self.sys.programHandleRequestClose(&child) != 0) return false;
+        var completion: r4os.abi.ProgramProcessCompletion = .{};
+        if (self.sys.programObservationWait(&observation, self.sys.ticksFromMilliseconds(5000), &completion) != 0 or
+            completion.sequence == 0 or completion.flags & r4os.abi.program_completion_flag_ready == 0 or
+            !std.meta.eql(completion.handle, child) or completion.exit_code != 0) return false;
+        const clock = self.root.clock() catch return false;
+        var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 })) catch return false;
+        while (true) {
+            var state: r4os.abi.ProgramInstanceInfo = .{};
+            const status = self.sys.programHandleStatus(&child, &state);
+            if (status == r4os.abi.program_handle_error_not_found or status == r4os.abi.program_handle_error_stale) break;
+            _ = budget.remainingTicks() catch return false;
+            self.sys.sleepTicks(1);
+        }
+        if (self.sys.programObservationRelease(&observation) != 0) return false;
+        retained = false;
+        self.sys.println("R4CODE desktop frame confirmed and exact process closed/reaped, observation released");
+        return true;
+    }
+
+    fn toolResult(self: *R4CodeSelfTest, step: []const u8, code: i32) void {
+        var memory: [80]u8 = undefined;
+        self.sys.println(std.fmt.bufPrint(&memory, "R4CODE tool {s} result={d}", .{ step, code }) catch "R4CODE tool result unavailable");
     }
 
     fn printBuildLog(self: *R4CodeSelfTest) void {
@@ -2027,46 +2191,87 @@ const r4code_selftest_desktop_artifact_path = "C:\\TEMP\\R4CODE\\HELLOGUI\\out\\
 
 const r4code_selftest_console_source =
     \\#include <r4os/r4os.h>
-    \\
-    \\R4OS_TEXT(hello_message, "HELLO from R4CODE edited source");
-    \\
-    \\int32_t r4_app_main(R4App *app)
-    \\{
-    \\    return r4sys_write_line(&app->system, hello_message);
+    \\#include <r4os/app2.h>
+    \\#include <r4os/launch_io_platform2.h>
+    \\R4OS_TEXT(message, "HELLO from R4CODE edited source via R4OS SDK\r\n");
+    \\int32_t r4_app_main(R4App2 *app) {
+    \\    R4Sys system;
+    \\    R4SdkStdio io;
+    \\    if (r4_app2_system(app, &system) != 0) return 1;
+    \\    if (R4SdkStdio2(&app->context, &io) != 0) return 1;
+    \\    R4WaitSetDeadline poll = { .version = 1, .size = sizeof(poll) };
+    \\    uint64_t written = 0;
+    \\    while (written < sizeof(message) - 1) {
+    \\        R4BytePipeProgress progress = { .version = 1, .size = sizeof(progress) };
+    \\        int32_t code = R4SdkStdioWrite(&io, 1, (const uint8_t *)message + written,
+    \\            sizeof(message) - 1 - written, &poll, &progress);
+    \\        if (code != 0) return code;
+    \\        written += progress.bytes;
+    \\        if (progress.state != R4OS_BYTE_PIPE_READY && progress.state != R4OS_BYTE_PIPE_WOULD_BLOCK) return 1;
+    \\        if (r4_app2_should_close(app)) return 0;
+    \\        if (written < sizeof(message) - 1) r4sys_sleep_ticks(&system, 1);
+    \\    }
+    \\    return 0;
     \\}
-    \\
 ;
 
 const r4code_selftest_desktop_source =
+    \\#include <r4os/app2.h>
     \\#include <r4os/r4os.h>
     \\
     \\R4OS_TEXT(window_title, "HELLOGUI");
     \\R4OS_TEXT(ok_label, "OK");
     \\R4OS_TEXT(message, "HELLO from R4CODE Desktop OK");
     \\
-    \\int32_t r4_app_main(R4App *app)
+    \\static int32_t draw_window(R4Window *window)
     \\{
-    \\    R4Timer timers[1] = {{0}}; R4Window window; R4PaintContext paint;
-    \\    if (!r4_window_open(app, timers, 1, &window)) return R4OS_ERR_NO_GROUP;
-    \\    r4_window_set_title(&window, window_title); r4_window_set_minimum_size(&window, 260, 140);
-    \\    if (!r4_window_begin_paint(&window, &paint)) return R4OS_ERR_NO_FN;
+    \\    R4PaintContext paint;
+    \\    if (!r4_window_begin_paint(window, &paint)) return R4OS_ERR_NO_FN;
     \\    R4Canvas canvas = r4_paint_canvas(&paint);
-    \\    r4_canvas_clear(canvas, 0x00C0C0C0); r4_canvas_rect(canvas, 84, 78, 72, 24, 0x00C0C0C0);
-    \\    r4_canvas_text(canvas, 58, 50, message, 0x000000, 0x00FFFFFF); r4_canvas_text(canvas, 112, 86, ok_label, 0x000000, 0x00C0C0C0); r4_paint_present(&paint);
-    \\    for (;;) { R4MessageNext next = r4_window_wait_message(&window, r4_timeout_forever());
-    \\        if (next.state == R4_MESSAGE_NEXT_FAILED) return next.raw_code;
-    \\        if (next.message.kind == R4_MESSAGE_CLOSE) return 0;
-    \\        if (next.message.kind == R4_MESSAGE_MOUSE && next.message.value.mouse.action == R4_MOUSE_UP) return 0; }
+    \\    r4_canvas_clear(canvas, 0x00C0C0C0);
+    \\    r4_canvas_rect(canvas, 44, 36, 172, 72, 0x00808080);
+    \\    r4_canvas_rect(canvas, 45, 37, 170, 70, 0x00FFFFFF);
+    \\    r4_canvas_rect(canvas, 84, 78, 72, 24, 0x00C0C0C0);
+    \\    r4_canvas_text(canvas, 58, 50, message, 0x000000, 0x00FFFFFF);
+    \\    r4_canvas_text(canvas, 112, 86, ok_label, 0x000000, 0x00C0C0C0);
+    \\    return r4_paint_present(&paint);
     \\}
     \\
+    \\static int32_t work(R4App *app)
+    \\{
+    \\    R4Timer timers[1] = {{0}};
+    \\    R4Window window;
+    \\    if (!r4_window_open(app, timers, 1, &window)) return R4OS_ERR_NO_GROUP;
+    \\    r4_window_set_title(&window, window_title);
+    \\    r4_window_set_minimum_size(&window, 260, 140);
+    \\    if (draw_window(&window) < 0) return R4OS_ERR_NO_FN;
+    \\
+    \\    for (;;) {
+    \\        R4MessageNext next = r4_window_wait_message(&window, r4_timeout_forever());
+    \\        if (next.state == R4_MESSAGE_NEXT_FAILED) return next.raw_code;
+    \\        if (next.state != R4_MESSAGE_NEXT_MESSAGE) continue;
+    \\        if (next.message.kind == R4_MESSAGE_CLOSE) return 0;
+    \\        if (next.message.kind == R4_MESSAGE_RESIZE) draw_window(&window);
+    \\        if (next.message.kind == R4_MESSAGE_MOUSE &&
+    \\            next.message.value.mouse.action == R4_MOUSE_UP &&
+    \\            next.message.value.mouse.x >= 84 && next.message.value.mouse.x < 156 &&
+    \\            next.message.value.mouse.y >= 78 && next.message.value.mouse.y < 102) {
+    \\            return 0;
+    \\        }
+    \\    }
+    \\}
+    \\
+    \\int32_t r4_app_main(R4App2 *app2){
+    \\ R4App app;int32_t rc=r4_app2_facade(app2,&app);if(rc<0)return rc;return work(&app);
+    \\}
 ;
 
 const r4code_selftest_bad_source =
     \\#include <r4os/r4os.h>
     \\
-    \\int32_t r4_app_main(R4App *app)
+    \\int32_t r4_app_main(R4App2 *app)
     \\{
-    \\    return r4sys_write_line(&app->system, missing_message);
+    \\    return missing_message;
     \\}
     \\
 ;
@@ -2332,32 +2537,38 @@ fn equalsBytes(a: []const u8, b: []const u8) bool {
 fn writeFileSys(sys: *const r4os.r4sys.Context, path: []const u8, data: []const u8) bool {
     var path_z: [path_capacity]u8 = .{0} ** path_capacity;
     if (!setZResult(path_z[0..], path)) return false;
-    const written = sys.fileWrite(zptr(path_z[0..]), data);
-    return written >= 0 and @as(usize, @intCast(written)) == data.len;
+    var saver: r4os.document_save.Saver = .{};
+    return saver.save(.{ .sys = sys.* }, .{ .ptr = zptr(&path_z), .len = @intCast(path.len) }, data, false).committed();
 }
 
 fn readFileSys(sys: *const r4os.r4sys.Context, path: []const u8, out: []u8) ?[]const u8 {
     var path_z: [path_capacity]u8 = .{0} ** path_capacity;
     if (!setZResult(path_z[0..], path)) return null;
-    const read = sys.fileRead(zptr(path_z[0..]), out);
-    if (read <= 0) return null;
-    const len: usize = @intCast(read);
-    if (len >= out.len) return null;
-    return out[0..len];
+    const files: r4os.Files = .{ .sys = sys.* };
+    return switch (files.readDocumentPrefix(.{ .ptr = zptr(&path_z), .len = @intCast(path.len) }, out, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 }))) {
+        .value => |value| if (value.truncated or value.bytes == 0) null else out[0..value.bytes],
+        .failure => null,
+    };
 }
 
 fn fileExistsSys(sys: *const r4os.r4sys.Context, path: []const u8) bool {
     var path_z: [path_capacity]u8 = .{0} ** path_capacity;
     if (!setZResult(path_z[0..], path)) return false;
-    if (sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0 and info.is_dir == 0;
-    return false;
+    const context = sys.base.generation2 orelse return false;
+    return switch (r4os.metadata2.info(context, zptr(&path_z))) {
+        .found => |info| info.flags & r4os.abi.file_metadata2_flag_directory == 0,
+        else => false,
+    };
 }
 
 fn dirExistsSys(sys: *const r4os.r4sys.Context, path: []const u8) bool {
     var path_z: [path_capacity]u8 = .{0} ** path_capacity;
     if (!setZResult(path_z[0..], path)) return false;
-    if (sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0 and info.is_dir != 0;
-    return false;
+    const context = sys.base.generation2 orelse return false;
+    return switch (r4os.metadata2.info(context, zptr(&path_z))) {
+        .found => |info| info.flags & r4os.abi.file_metadata2_flag_directory != 0,
+        else => false,
+    };
 }
 
 fn ensureDirectorySys(sys: *const r4os.r4sys.Context, path: []const u8) bool {
@@ -2469,7 +2680,11 @@ fn checkNativeDialog(app: *App) !void {
     app.saveFromDialog();
     if (app.dirty or !std.mem.eql(u8, spanZ(&app.current_path), spanZ(&second))) return error.LongSaveNotCommitted;
     app.dialog = .save_as;
-    if (!app.loadDirectory()) return error.DirectoryPage;
+    if (!app.loadDirectory()) {
+        var detail: [80]u8 = undefined;
+        app.ctx.sys.println(try std.fmt.bufPrint(&detail, "R4CODE picker result={d}", .{app.directory_page.last_error}));
+        return error.DirectoryPage;
+    }
     var found = false;
     for (app.directory_page.rows[0..app.directory_page.count], 0..) |row, index| {
         if (!r4os.bounded_text.valid(spanZ(&row.label))) return error.SplitLabel;
@@ -2496,9 +2711,21 @@ fn checkNativeDialog(app: *App) !void {
         app.ctx.sys.dirDelete(directory) <= 0) return error.PrivateCleanup;
 }
 
+fn checkCompositionControl(app: *App) !void {
+    const before = try app.ctx.sys.allocator().dupe(u8, app.editor.value());
+    defer app.ctx.sys.allocator().free(before);
+    const revision = app.text_revision;
+    app.probeComposition();
+    if (app.composition_status != r4os.abi.composition_error_no_provider) return error.ExpectedNoProvider;
+    if (!std.mem.eql(u8, before, app.editor.value()) or revision != app.text_revision or app.composition.phase != 0) return error.UncommittedTextMutation;
+}
+
 fn runDialogTextSelfTest(ctx: *AppApi) i32 {
     var storage = App{ .ctx = ctx };
     const app = &storage;
+    defer {
+        if (app.composition_client) |*client| _ = client.close();
+    }
     checkDialogText(app) catch |err| {
         ctx.sys.write("R4CODE Unicode dialog selftest FAILED: ");
         ctx.sys.println(@errorName(err));
@@ -2510,7 +2737,12 @@ fn runDialogTextSelfTest(ctx: *AppApi) i32 {
         ctx.sys.println(@errorName(err));
         return 1;
     };
-    ctx.sys.println("R4CODE Unicode dialog selftest: OK codepoints=whole capacity=retained save=exact labels=separate cleanup=complete");
+    checkCompositionControl(app) catch |err| {
+        ctx.sys.write("R4CODE composition selftest FAILED: ");
+        ctx.sys.println(@errorName(err));
+        return 1;
+    };
+    ctx.sys.println("R4CODE Unicode dialog selftest: OK codepoints=whole capacity=retained save=exact labels=separate cleanup=complete IME=NoProvider");
     return 0;
 }
 
