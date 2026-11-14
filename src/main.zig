@@ -2756,7 +2756,7 @@ test "R4CODE dialog owner Unicode prefill scalar editing and rejected save capac
 test "R4CODE dialog owner non-app manifest summaries keep actual role and nullable app fields" {
     const allocator = std.testing.allocator;
     inline for (.{ "R4D", "R4P" }) |kind| {
-        const text = "R4OS_MODULE_MANIFEST=2\nKIND=" ++ kind ++ "\nNAME=OWNER\nVERSION=0.1.0\nLANGUAGE=C\nSOURCE=main.c\nTARGET=/R4OS/OWNER." ++ kind ++ "\nIMAGE_SCOPE=none\nIMPORT=R4DEV:Query:1\n";
+        const text = "R4OS_MODULE_MANIFEST=2\nKIND=" ++ kind ++ "\nNAME=OWNER\nVERSION=0.1.0\nLANGUAGE=C\nSOURCE=main.c\nTARGET=/R4OS/OWNER." ++ kind ++ "\nIMAGE_SCOPE=none\nIMPORT=R4DEV:Query2:2\n";
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const manifest = try r4os.r4mf.parse(arena.allocator(), "Owner/module.R4MF", text);
